@@ -10,7 +10,7 @@ interface SdkConfig {
   flushIntervalMs?: number;
   maxRetryAttempts?: number;
   initialRetryDelayMs?: number;
-  trackPageViews?: boolean; // NEW: Toggle automatic page view tracking on/off
+  trackPageViews?: boolean;
 }
 
 export class EventTracker {
@@ -24,7 +24,10 @@ export class EventTracker {
   private timer: ReturnType<typeof setInterval> | null = null;
   private isSending = false;
   private readonly storageKey = 'tx_events_retry_queue';
-  private lastTrackedUrl = ''; // NEW: Cache to prevent duplicate event tracking
+  private lastTrackedUrl = '';
+  
+  // NEW: In-memory array fallback if localStorage is missing or blocked
+  private memoryStorageFallback: string = '[]'; 
 
   constructor(config: SdkConfig) {
     this.endpoint = config.endpoint;
@@ -33,12 +36,14 @@ export class EventTracker {
     this.maxRetryAttempts = config.maxRetryAttempts ?? 5;
     this.initialRetryDelayMs = config.initialRetryDelayMs ?? 1000;
 
-    this.initHeartbeat();
-    this.initOfflineListeners();
+    // SAFE ENVIRONMENT CHECK: Only initialize timers and listeners on the client side
+    if (typeof window !== 'undefined') {
+      this.initHeartbeat();
+      this.initOfflineListeners();
 
-    // NEW: If enabled, start watching the browser URL automatically
-    if (config.trackPageViews ?? true) {
-      this.initPageViewTracking();
+      if (config.trackPageViews ?? true) {
+        this.initPageViewTracking();
+      }
     }
   }
 
@@ -60,26 +65,22 @@ export class EventTracker {
     }
   }
 
-  // NEW METHOD: Monitors URL route updates dynamically
+  // Monitor URL route updates dynamically
   private initPageViewTracking(): void {
     if (typeof window === 'undefined') return;
 
-    // 1. Track the very first initial page load landing
     this.trackPageView();
 
-    // 2. Listen for standard browser Back/Forward clicks
     window.addEventListener('popstate', () => this.trackPageView());
 
-    // 3. Monkey-patch pushState (Triggers when single-page apps update the URL quietly)
     const originalPushState = window.history.pushState;
-    const trackerInstance = this; // Capture the outer context safely
+    const trackerInstance = this;
     
     window.history.pushState = function (...args) {
-      originalPushState.apply(this, args); // Execute original behavior first
-      trackerInstance.trackPageView(); // Trigger our tracker immediately right after
+      originalPushState.apply(this, args);
+      trackerInstance.trackPageView();
     };
 
-    // 4. Monkey-patch replaceState (Triggers when single-page apps redirect paths quietly)
     const originalReplaceState = window.history.replaceState;
     window.history.replaceState = function (...args) {
       originalReplaceState.apply(this, args);
@@ -87,16 +88,15 @@ export class EventTracker {
     };
   }
 
-  // Helper method to execute a filtered Page View track
   private trackPageView(): void {
-    const currentUrl = window.location.href;
+    if (typeof window === 'undefined') return;
     
-    // Prevent double-tracking the exact same page path continuously
+    const currentUrl = window.location.href;
     if (currentUrl === this.lastTrackedUrl) return;
     
     this.lastTrackedUrl = currentUrl;
     this.track('page_view', {
-      title: document.title
+      title: typeof document !== 'undefined' ? document.title : ''
     });
   }
 
@@ -117,14 +117,18 @@ export class EventTracker {
     }
   }
 
-  // Gather system details automatically
+  // Gather system details automatically (Heavily fortified against Server Environments)
   private getContextEnrichment(): Record<string, any> {
-    if (typeof window === 'undefined') return {};
+    // Return empty context details if running on Node.js / Server Side
+    if (typeof window === 'undefined') {
+      return { environment: 'server' }; 
+    }
 
     return {
+      environment: 'browser',
       url: window.location.href,
-      referrer: document.referrer,
-      screen_resolution: `${window.screen.width}x${window.screen.height}`,
+      referrer: typeof document !== 'undefined' ? document.referrer : '',
+      screen_resolution: window.screen ? `${window.screen.width}x${window.screen.height}` : '',
       viewport_size: `${window.innerWidth}x${window.innerHeight}`,
       user_agent: navigator.userAgent,
       language: navigator.language,
@@ -137,7 +141,8 @@ export class EventTracker {
 
     while (attempt < this.maxRetryAttempts) {
       try {
-        if (!navigator.onLine) {
+        // Safe check for navigator availability
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
           throw new Error('Network offline');
         }
 
@@ -164,18 +169,15 @@ export class EventTracker {
         }
 
         const delay = this.initialRetryDelayMs * Math.pow(2, attempt - 1);
-        console.warn(`⚠️ Request failed. Retrying attempt ${attempt}/${this.maxRetryAttempts} in ${delay}ms...`);
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
 
-  // Set up the time-based flush interval
   private initHeartbeat(): void {
     this.timer = setInterval(() => this.flush(), this.flushIntervalMs);
   }
 
-  // Listen for connection recovery
   private initOfflineListeners(): void {
     if (typeof window === 'undefined') return;
 
@@ -183,20 +185,34 @@ export class EventTracker {
     this.retryStoredEvents();
   }
 
-  // Persistence management
+  // NEW ENHANCEMENT: Fail-safe Storage Writer
   private saveToStorage(events: AnalyticsEvent[]): void {
     try {
       const existing = this.getStoredEvents();
       const updated = [...existing, ...events];
-      localStorage.setItem(this.storageKey, JSON.stringify(updated));
+      const serialized = JSON.stringify(updated);
+
+      if (this.isLocalStorageAvailable()) {
+        localStorage.setItem(this.storageKey, serialized);
+      } else {
+        this.memoryStorageFallback = serialized;
+      }
     } catch (e) {
-      console.error('Failed to save events to localStorage', e);
+      console.error('Failed to preserve events safely', e);
     }
   }
 
+  // NEW ENHANCEMENT: Fail-safe Storage Reader
   private getStoredEvents(): AnalyticsEvent[] {
     try {
-      const data = localStorage.getItem(this.storageKey);
+      let data: string | null = null;
+
+      if (this.isLocalStorageAvailable()) {
+        data = localStorage.getItem(this.storageKey);
+      } else {
+        data = this.memoryStorageFallback;
+      }
+
       return data ? JSON.parse(data) : [];
     } catch {
       return [];
@@ -210,7 +226,12 @@ export class EventTracker {
     if (stored.length === 0) return;
 
     this.isSending = true;
-    localStorage.removeItem(this.storageKey);
+
+    if (this.isLocalStorageAvailable()) {
+      localStorage.removeItem(this.storageKey);
+    } else {
+      this.memoryStorageFallback = '[]';
+    }
 
     for (let i = 0; i < stored.length; i += this.batchSize) {
       const chunk = stored.slice(i, i + this.batchSize);
@@ -223,6 +244,22 @@ export class EventTracker {
       }
     }
     this.isSending = false;
+  }
+
+  // NEW ENHANCEMENT: Robust capability check helper
+  // Catches edge-cases where localStorage exists but is explicitly blocked by Safari Incognito or Chrome Privacy modes
+  private isLocalStorageAvailable(): boolean {
+    if (typeof window === 'undefined' || !('localStorage' in window)) {
+      return false;
+    }
+    try {
+      const testKey = '__storage_test__';
+      localStorage.setItem(testKey, testKey);
+      localStorage.removeItem(testKey);
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   public destroy(): void {
