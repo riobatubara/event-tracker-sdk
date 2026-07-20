@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Event Tracker Test Page</title>
+</head>
+<body>
+
+    <h1>Welcome to My Awesome Website 🚀</h1>
+    <p>Click the buttons below to test the TypeScript event tracker SDK.</p>
+
+    <!-- Interactive Buttons -->
+    <button id="blueBtn" style="background: blue; color: white; padding: 10px;">Click Blue Button</button>
+    <button id="greenBtn" style="background: green; color: white; padding: 10px;">Click Green Button</button>
+
+    <!-- Import our freshly compiled JavaScript tracker script -->
+    <script type="module">
+        import { EventTracker } from './tracker.js';
+
+        // 2. Initialize the tracker
+        // We set batchSize to 3 so it fires quickly when you click!
+        const tracker = new EventTracker({
+          endpoint: 'https://localhost:8080/api/v1/event', // A safe, fake API endpoint that accepts data
+          batchSize: 3, 
+          flushIntervalMs: 5000
+        });
+
+        console.log("SDK loaded perfectly inside the browser!");
+
+        // 3. Attach click events to our buttons
+        document.getElementById('blueBtn').addEventListener('click', () => {
+            tracker.track('button_click', { color: 'blue' });
+            console.log("Event added to queue (Blue Button)");
+        });
+
+        document.getElementById('greenBtn').addEventListener('click', () => {
+            tracker.track('button_click', { color: 'green' });
+            console.log("Event added to queue (Green Button)");
+        });
+    </script>
+</body>
+</html>
