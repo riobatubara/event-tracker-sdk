@@ -8,8 +8,9 @@ interface SdkConfig {
   endpoint: string;
   batchSize?: number;
   flushIntervalMs?: number;
-  maxRetryAttempts?: number; // Maximum times to retry before giving up
-  initialRetryDelayMs?: number; // Starting delay (e.g., 1 second)
+  maxRetryAttempts?: number;
+  initialRetryDelayMs?: number;
+  trackPageViews?: boolean; // NEW: Toggle automatic page view tracking on/off
 }
 
 export class EventTracker {
@@ -23,6 +24,7 @@ export class EventTracker {
   private timer: ReturnType<typeof setInterval> | null = null;
   private isSending = false;
   private readonly storageKey = 'tx_events_retry_queue';
+  private lastTrackedUrl = ''; // NEW: Cache to prevent duplicate event tracking
 
   constructor(config: SdkConfig) {
     this.endpoint = config.endpoint;
@@ -33,6 +35,11 @@ export class EventTracker {
 
     this.initHeartbeat();
     this.initOfflineListeners();
+
+    // NEW: If enabled, start watching the browser URL automatically
+    if (config.trackPageViews ?? true) {
+      this.initPageViewTracking();
+    }
   }
 
   // Public API to track events
@@ -53,6 +60,46 @@ export class EventTracker {
     }
   }
 
+  // NEW METHOD: Monitors URL route updates dynamically
+  private initPageViewTracking(): void {
+    if (typeof window === 'undefined') return;
+
+    // 1. Track the very first initial page load landing
+    this.trackPageView();
+
+    // 2. Listen for standard browser Back/Forward clicks
+    window.addEventListener('popstate', () => this.trackPageView());
+
+    // 3. Monkey-patch pushState (Triggers when single-page apps update the URL quietly)
+    const originalPushState = window.history.pushState;
+    const trackerInstance = this; // Capture the outer context safely
+    
+    window.history.pushState = function (...args) {
+      originalPushState.apply(this, args); // Execute original behavior first
+      trackerInstance.trackPageView(); // Trigger our tracker immediately right after
+    };
+
+    // 4. Monkey-patch replaceState (Triggers when single-page apps redirect paths quietly)
+    const originalReplaceState = window.history.replaceState;
+    window.history.replaceState = function (...args) {
+      originalReplaceState.apply(this, args);
+      trackerInstance.trackPageView();
+    };
+  }
+
+  // Helper method to execute a filtered Page View track
+  private trackPageView(): void {
+    const currentUrl = window.location.href;
+    
+    // Prevent double-tracking the exact same page path continuously
+    if (currentUrl === this.lastTrackedUrl) return;
+    
+    this.lastTrackedUrl = currentUrl;
+    this.track('page_view', {
+      title: document.title
+    });
+  }
+
   // Force send all events currently in buffer
   public async flush(): Promise<void> {
     if (this.buffer.length === 0 || this.isSending) return;
@@ -64,7 +111,6 @@ export class EventTracker {
     try {
       await this.sendRequestWithBackoff(payload);
     } catch (error) {
-      // If backoff completely fails (or network goes dead), dump safely to localStorage
       this.saveToStorage(payload);
     } finally {
       this.isSending = false;
@@ -101,37 +147,24 @@ export class EventTracker {
           body: JSON.stringify({ events }),
         });
 
-        // 2xx response status codes mean total success
         if (response.ok) {
           return; 
         }
 
-        // If server gives a client-side error (like 400 Bad Request or 403 Forbidden), 
-        // retrying won't change the outcome. Break early and throw to prevent infinite loops.
         if (response.status >= 400 && response.status < 500) {
           throw new Error(`Client Error: ${response.status}`);
         }
 
-        // If it reaches here, it's likely a 5xx Server Error. Loop continues to try again!
         throw new Error(`Server Error: ${response.status}`);
 
       } catch (error) {
         attempt++;
-        
-        // If we have exhausted our maximum allowed retries, pass the error up to the handler
         if (attempt >= this.maxRetryAttempts) {
           throw error;
         }
 
-        // Calculate Exponential Backoff Delay: Delay = InitialDelay * 2^(attempt - 1)
-        // Attempt 1 delay: 1000 * 2^0 = 1000ms (1s)
-        // Attempt 2 delay: 1000 * 2^1 = 2000ms (2s)
-        // Attempt 3 delay: 1000 * 2^2 = 4000ms (4s)
         const delay = this.initialRetryDelayMs * Math.pow(2, attempt - 1);
-        
         console.warn(`⚠️ Request failed. Retrying attempt ${attempt}/${this.maxRetryAttempts} in ${delay}ms...`);
-        
-        // Wait for the calculated delay duration before moving to the next iteration loop
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
@@ -179,13 +212,11 @@ export class EventTracker {
     this.isSending = true;
     localStorage.removeItem(this.storageKey);
 
-    // Chunk the stored items back into regular batch sizes for safety
     for (let i = 0; i < stored.length; i += this.batchSize) {
       const chunk = stored.slice(i, i + this.batchSize);
       try {
         await this.sendRequestWithBackoff(chunk);
       } catch (error) {
-        // Put remaining un-sent items back if network or backoff fails mid-way
         const failedRemaining = stored.slice(i);
         this.saveToStorage(failedRemaining);
         break;
@@ -194,7 +225,6 @@ export class EventTracker {
     this.isSending = false;
   }
 
-  // Cleanup system resources
   public destroy(): void {
     if (this.timer) clearInterval(this.timer);
     this.flush();
